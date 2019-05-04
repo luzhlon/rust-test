@@ -7,8 +7,9 @@ use std::os::windows::prelude::*;
 use std::mem::size_of;
 use winapi::shared::minwindef::{MAX_PATH, BOOL};
 use winapi::um::tlhelp32::*;
+use winapi::um::processthreadsapi::*;
 use winapi::um::handleapi::{INVALID_HANDLE_VALUE, CloseHandle};
-use winapi::um::winnt::HANDLE;
+use winapi::um::winnt::*;
 
 use std::iter::Iterator;
 
@@ -106,21 +107,24 @@ struct ThreadInfo {
 
 struct ThreadEntry {
     base: TlHelpIter<THREADENTRY32>,
+    pid : u32,
 }
 
 impl Iterator for ThreadEntry {
     type Item = ThreadInfo;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.base.next_item() {
+        while self.base.next_item() {
             let data = &self.base.data;
-            Some(ThreadInfo {
+            if data.th32OwnerProcessID != self.pid {
+                continue;
+            }
+            return Some(ThreadInfo {
                 pid: data.th32OwnerProcessID as u32,
                 tid: data.th32ThreadID as u32,
-            })
-        } else {
-            None
+            });
         }
+        return None;
     }
 }
 
@@ -132,7 +136,7 @@ fn enum_thread(pid: u32) -> ThreadEntry {
         return ThreadEntry { base: TlHelpIter::new(
             CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid), te32,
                 |h, d| Thread32First(h, d), |h, d| Thread32Next(h, d)
-        )};
+        ), pid: pid};
     }
 }
 
@@ -176,11 +180,41 @@ fn enum_module(pid: u32) -> ModuleEntry {
     }
 }
 
-fn main() {
-    // for p in enum_process() { println!("{} {}", p.pid, p.name.to_str().unwrap()); }
-    for p in enum_process().filter(|p| !p.name.to_str().unwrap().find("vim").is_none()) {
-        println!("{} {}", p.pid, p.name.to_str().unwrap());
+struct Process {
+    pid: u32,
+    handle: HANDLE,
+}
+
+impl Process {
+    fn from_pid(pid: u32) -> Option<Process> {
+        unsafe {
+            let handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+            if handle == INVALID_HANDLE_VALUE { return None; }
+            return Some(Process {
+                pid: pid, handle: handle,
+            });
+        }
     }
-    for t in enum_thread(16836) { println!("{}", t.tid); }
-    for m in enum_module(16836) { println!("{:08X} {}", m.base, m.name.to_str().unwrap()); }
+
+    fn from_name(name: &str) -> Option<Process> {
+        for p in enum_process()
+            .filter(|p| p.name.to_str().unwrap().find(name).is_some()) {
+            return Process::from_pid(p.pid);
+        }
+        return None;
+    }
+}
+
+fn main() {
+    let p = Process::from_name("vim");
+    println!("p {}", p.unwrap().pid);
+    // for p in enum_process() { println!("{} {}", p.pid, p.name.to_str().unwrap()); }
+    for p in enum_process().filter(|p| p.name.to_str().unwrap().find("vim").is_some()) {
+        println!("{} {}", p.pid, p.name.to_str().unwrap());
+        println!("Threads:");
+        for t in enum_thread(p.pid) { println!("  {}", t.tid); }
+        println!("Modules:");
+        for m in enum_module(p.pid) { println!("  {:p} {}", m.base as *const char, m.name.to_str().unwrap()); }
+        break;
+    }
 }
