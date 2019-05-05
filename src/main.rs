@@ -4,14 +4,18 @@ extern crate winapi;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::prelude::*;
 
-use std::mem::size_of;
-use winapi::shared::minwindef::{MAX_PATH, BOOL};
+use std::mem::{size_of, size_of_val, transmute};
+use winapi::shared::minwindef::*;
 use winapi::um::tlhelp32::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::handleapi::{INVALID_HANDLE_VALUE, CloseHandle};
 use winapi::um::winnt::*;
+use winapi::um::winbase::*;
+use winapi::um::errhandlingapi::*;
+use winapi::um::psapi::*;
 
 use std::iter::Iterator;
+use std::ptr::*;
 
 struct TlHelpIter<T: Clone> {
     count: u32,
@@ -90,7 +94,7 @@ impl Iterator for ProcessEntry {
 fn enum_process() -> ProcessEntry {
     unsafe {
         let mut pe32: PROCESSENTRY32W = std::mem::zeroed();
-        pe32.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        pe32.dwSize = size_of_val(&pe32) as u32;
         return ProcessEntry { base: TlHelpIter::new(
             CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0), pe32,
                 |h, d| Process32FirstW(h, d), |h, d| Process32NextW(h, d)
@@ -143,7 +147,7 @@ fn enum_thread(pid: u32) -> ThreadEntry {
 // --------------------------------------------
 
 struct ModuleInfo {
-    name: OsString,
+    name: String,
     base: u64,
     size: u32,
 }
@@ -159,7 +163,7 @@ impl Iterator for ModuleEntry {
         if self.base.next_item() {
             let data = &self.base.data;
             Some(ModuleInfo {
-                name: OsString::from_wide(&data.szModule),
+                name: OsString::from_wide(&data.szModule).into_string().unwrap(),
                 base: data.modBaseAddr as u64,
                 size: data.modBaseSize as u32,
             })
@@ -179,6 +183,26 @@ fn enum_module(pid: u32) -> ModuleEntry {
         )};
     }
 }
+
+fn get_current_pid() -> DWORD {
+    unsafe { GetCurrentProcessId() }
+}
+
+fn last_error(code: DWORD) -> String {
+    unsafe {
+        let mut buf = [0 as u16; MAX_PATH as usize];
+        if FormatMessageW(
+            FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_FROM_SYSTEM,
+            null_mut(), code, 0, buf.as_mut_ptr(),
+            buf.len() as u32, null_mut()) != 0 {
+            OsString::from_wide(&buf).into_string().unwrap()
+        } else { "".to_string() }
+    }
+}
+
+fn get_last_error() -> DWORD { unsafe { GetLastError() } }
+
+fn last_error_str() -> String { last_error(get_last_error()) }
 
 struct Process {
     pid: u32,
@@ -203,18 +227,86 @@ impl Process {
         }
         return None;
     }
+
+    fn get_module_name(&self, module: u64) -> Result<String, String> {
+        unsafe {
+            let mut name = [0 as u16; MAX_PATH];
+            if GetModuleBaseNameW(self.handle, module as HMODULE, name.as_mut_ptr(), MAX_PATH as u32) > 0 {
+                OsString::from_wide(&name).into_string().map_err(|x| "".to_string())
+            } else { Err(last_error_str()) }
+        }
+    }
+
+    fn get_module_path(&self, module: u64) -> Result<String, String> {
+        unsafe {
+            let mut path = [0 as u16; MAX_PATH];
+            if GetModuleFileNameExW(self.handle, module as HMODULE, path.as_mut_ptr(), MAX_PATH as u32) > 0 {
+                OsString::from_wide(&path).into_string().map_err(|x| "".to_string())
+            } else { Err(last_error_str()) }
+        }
+    }
+
+    fn get_modules(&self) -> Option<Vec<ModuleInfo>> {
+        let mut module_handles = vec![0 as HMODULE; 64];
+        let mut needed = 0 as DWORD;
+        unsafe {
+            let mut result = EnumProcessModulesEx(
+                self.handle, module_handles.as_mut_ptr(),
+                (size_of::<HMODULE>() * module_handles.len()) as u32,
+                &mut needed, LIST_MODULES_ALL);
+            module_handles.resize(needed as usize, 0 as HMODULE);
+            if result == 0 {
+                result = EnumProcessModulesEx(self.handle, module_handles.as_mut_ptr(),
+                (size_of::<HMODULE>() * module_handles.len()) as u32,
+                &mut needed, LIST_MODULES_ALL);
+            }
+            if result == 0 { return None; }
+
+            let mut modules = Vec::<ModuleInfo>::new();
+            println!("modules len {}", modules.len());
+            for i in 0 .. needed as usize {
+                let hModule = module_handles[i as usize];
+                if hModule == null_mut() { break; }
+
+                let mut modinfo: MODULEINFO = std::mem::zeroed();
+                if GetModuleInformation(self.handle, hModule, &mut modinfo, size_of_val(&modinfo) as u32) > 0 {
+                    modules.push(ModuleInfo {
+                        base: hModule as u64,
+                        size: modinfo.SizeOfImage,
+                        name: self.get_module_name(hModule as u64).unwrap(),
+                    });
+                }
+            }
+            println!("modules len {}", modules.len());
+            return Some(modules);
+        }
+    }
+}
+
+// #[test]
+fn test_process() {
+    let p = Process::from_pid(get_current_pid()).unwrap();
+    println!("p {}", p.pid);
+    println!("p {}", last_error(1));
+    for m in p.get_modules().unwrap() {
+        let path = p.get_module_path(m.base).unwrap();
+        println!("  {:p} {}", m.base as *const char, path);
+    }
 }
 
 fn main() {
-    let p = Process::from_name("vim");
-    println!("p {}", p.unwrap().pid);
+    test_process();
     // for p in enum_process() { println!("{} {}", p.pid, p.name.to_str().unwrap()); }
-    for p in enum_process().filter(|p| p.name.to_str().unwrap().find("vim").is_some()) {
-        println!("{} {}", p.pid, p.name.to_str().unwrap());
-        println!("Threads:");
-        for t in enum_thread(p.pid) { println!("  {}", t.tid); }
-        println!("Modules:");
-        for m in enum_module(p.pid) { println!("  {:p} {}", m.base as *const char, m.name.to_str().unwrap()); }
-        break;
-    }
+    // for p in enum_process().filter(|p| p.name.to_str().unwrap().find("vim").is_some()) {
+    //     println!("{} {}", p.pid, p.name.to_str().unwrap());
+    //     println!("Threads:");
+    //     for t in enum_thread(p.pid) { println!("  {}", t.tid); }
+    //     println!("Modules:");
+    //     for m in enum_module(p.pid) { println!("  {:p} {}", m.base as *const char, m.name); }
+    //     break;
+    // }
+    // for m in enum_module(get_current_pid()) { println!("  {:p} {}", m.base as *const char, m.name); }
+
+    // let mut line = String::new();
+    // std::io::stdin().read_line(&mut line);
 }
