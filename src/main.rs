@@ -13,6 +13,8 @@ use winapi::um::winnt::*;
 use winapi::um::winbase::*;
 use winapi::um::errhandlingapi::*;
 use winapi::um::psapi::*;
+use winapi::um::memoryapi::*;
+use winapi::um::dbghelp::*;
 
 use std::iter::Iterator;
 use std::ptr::*;
@@ -210,25 +212,34 @@ struct Process {
 }
 
 impl Process {
-    fn from_pid(pid: u32) -> Option<Process> {
+    pub fn from_pid(pid: u32) -> Result<Process, String> {
         unsafe {
             let handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
-            if handle == INVALID_HANDLE_VALUE { return None; }
-            return Some(Process {
+            if handle == INVALID_HANDLE_VALUE { return Err(last_error_str()); }
+            return Process::from_handle(handle);
+        }
+    }
+
+    pub fn from_name(name: &str) -> Result<Process, String> {
+        for p in enum_process()
+            .filter(|p| p.name.to_str().unwrap().find(name).is_some()) {
+            return Process::from_pid(p.pid);
+        }
+        return Err("This Process is not exists".to_string());
+    }
+
+    pub fn from_handle(handle: HANDLE) -> Result<Process, String> {
+        unsafe {
+            let pid = GetProcessId(handle);
+            if pid == 0 { return Err(last_error_str()); }
+            SymInitializeW(handle, null_mut(), 1);
+            return Ok(Process {
                 pid: pid, handle: handle,
             });
         }
     }
 
-    fn from_name(name: &str) -> Option<Process> {
-        for p in enum_process()
-            .filter(|p| p.name.to_str().unwrap().find(name).is_some()) {
-            return Process::from_pid(p.pid);
-        }
-        return None;
-    }
-
-    fn get_module_name(&self, module: u64) -> Result<String, String> {
+    pub fn get_module_name(&self, module: u64) -> Result<String, String> {
         unsafe {
             let mut name = [0 as u16; MAX_PATH];
             if GetModuleBaseNameW(self.handle, module as HMODULE, name.as_mut_ptr(), MAX_PATH as u32) > 0 {
@@ -237,7 +248,7 @@ impl Process {
         }
     }
 
-    fn get_module_path(&self, module: u64) -> Result<String, String> {
+    pub fn get_module_path(&self, module: u64) -> Result<String, String> {
         unsafe {
             let mut path = [0 as u16; MAX_PATH];
             if GetModuleFileNameExW(self.handle, module as HMODULE, path.as_mut_ptr(), MAX_PATH as u32) > 0 {
@@ -246,7 +257,7 @@ impl Process {
         }
     }
 
-    fn get_modules(&self) -> Option<Vec<ModuleInfo>> {
+    pub fn get_modules(&self) -> Option<Vec<ModuleInfo>> {
         let mut module_handles = vec![0 as HMODULE; 64];
         let mut needed = 0 as DWORD;
         unsafe {
@@ -281,13 +292,61 @@ impl Process {
             return Some(modules);
         }
     }
+
+    pub fn image_file_name(&self) -> Result<String, String> {
+        unsafe {
+            let mut path = [0 as u16; MAX_PATH];
+            // if GetProcessImageFileNameW(self.handle, path.as_mut_ptr(), MAX_PATH as u32) > 0 {
+            //     OsString::from_wide(&path).into_string().map_err(|x| "".to_string())
+            // } else { Err(last_error_str()) }
+            let mut size = path.len() as u32;
+            if QueryFullProcessImageNameW(self.handle, 0, path.as_mut_ptr(), &mut size) > 0 {
+                OsString::from_wide(&path).into_string().map_err(|x| "".to_string())
+            } else { Err(last_error_str()) }
+        }
+    }
+
+    // fn read_memory(&self, address: u64, size: usize) -> Option<Vec<u8>> {
+    // }
+
+    pub fn write_memory(&self, address: u64, data: &[u8]) -> usize {
+        unsafe {
+            let mut written = 0 as usize;
+            if WriteProcessMemory(
+                self.handle,
+                address as LPVOID,
+                data.as_ptr() as LPVOID,
+                data.len(),
+                &mut written) > 0 { written as usize } else { 0 }
+        }
+    }
+
+    pub fn get_address_by_symbol(&self, symbol: &str) -> u64 {
+        unsafe {
+            let mut si: SYMBOL_INFOW = std::mem::zeroed();
+            si.SizeOfStruct = size_of_val(&si) as u32;
+
+            let name: Vec<u16> = OsStr::new(symbol).encode_wide().collect();
+            if SymFromNameW(self.handle, name.as_ptr(), &mut si) > 0 { si.Address as u64 } else { 0 }
+        }
+    }
+
+    // pub fn get_symbol_by_address(&self, address: u64) -> (String, u32) {
+    //     unsafe {
+    //         let mut si: SYMBOL_INFOW = std::mem::zeroed();
+    //         si.SizeOfStruct = size_of_val(&si) as u32;
+
+    //         let name: Vec<u16> = OsStr::new(symbol).encode_wide().collect();
+    //         if SymFromNameW(self.handle, name.as_ptr(), &mut si) > 0 { si.Address as u64 } else { 0 }
+    //     }
+    // }
 }
 
 // #[test]
 fn test_process() {
     let p = Process::from_pid(get_current_pid()).unwrap();
-    println!("p {}", p.pid);
-    println!("p {}", last_error(1));
+    println!("Process {} {}", p.pid, p.image_file_name().unwrap());
+    println!("Process CreateFileA {:x}", p.get_address_by_symbol("kernel32!CreateFileA"));
     for m in p.get_modules().unwrap() {
         let path = p.get_module_path(m.base).unwrap();
         println!("  {:p} {}", m.base as *const char, path);
